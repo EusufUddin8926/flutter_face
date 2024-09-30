@@ -1,15 +1,16 @@
 import 'dart:convert';
 import 'dart:io';
-import 'package:google_ml_kit/google_ml_kit.dart';
-import 'package:path_provider/path_provider.dart';
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:google_ml_kit/google_ml_kit.dart';
+import 'package:image/image.dart' as imglib;
+import 'package:path_provider/path_provider.dart';
+import 'package:quiver/collection.dart';
+import 'package:tflite_flutter/tflite_flutter.dart' as tfl;
+import 'package:tflite_flutter/tflite_flutter.dart';
 import 'detector_painters.dart';
 import 'utils.dart';
-import 'package:image/image.dart' as imglib;
-import 'package:tflite_flutter/tflite_flutter.dart' as tfl;
-import 'package:quiver/collection.dart';
-import 'package:flutter/services.dart';
 
 void main() {
   runApp(MaterialApp(
@@ -20,7 +21,6 @@ void main() {
     debugShowCheckedModeBanner: false,
   ));
 }
-
 
 class _MyHomePage extends StatefulWidget {
   @override
@@ -35,7 +35,7 @@ class _MyHomePageState extends State<_MyHomePage> {
   bool _isDetecting = false;
   CameraLensDirection _direction = CameraLensDirection.back;
   dynamic data = {};
-  double threshold = 1.0;
+  double threshold = 0.6;
   late Directory tempDir;
   List e1 = [];
   bool _faceFound = false;
@@ -44,23 +44,35 @@ class _MyHomePageState extends State<_MyHomePage> {
   @override
   void initState() {
     super.initState();
-    SystemChrome.setPreferredOrientations(
-        [DeviceOrientation.portraitUp, DeviceOrientation.portraitDown]);
+    SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
     _initializeCamera();
   }
 
   Future<void> loadModel() async {
+    late Delegate delegate;
     try {
-      final gpuDelegateV2 = tfl.GpuDelegateV2(
-        options: tfl.GpuDelegateOptionsV2(
-          isPrecisionLossAllowed: false,
-          inferencePriority1: tfl.TfLiteGpuInferencePriority.minLatency, // Priority 1
-          inferencePriority2: tfl.TfLiteGpuInferencePriority.auto,       // Priority 2
-          inferencePriority3: tfl.TfLiteGpuInferencePriority.auto,
-        ),
-      );
-      var interpreterOptions = tfl.InterpreterOptions()..addDelegate(gpuDelegateV2);
-      interpreter = await tfl.Interpreter.fromAsset('mobilefacenet.tflite', options: interpreterOptions);
+      if (Platform.isAndroid) {
+        delegate = tfl.GpuDelegateV2(
+          options: tfl.GpuDelegateOptionsV2(
+            isPrecisionLossAllowed: false,
+            inferencePriority1: tfl.TfLiteGpuInferencePriority.minLatency,
+            // Priority 1
+            inferencePriority2: tfl.TfLiteGpuInferencePriority.auto,
+            // Priority 2
+            inferencePriority3: tfl.TfLiteGpuInferencePriority.auto,
+          ),
+        );
+      }else{
+        delegate = GpuDelegate(
+          options: GpuDelegateOptions(
+              allowPrecisionLoss: true,
+              waitType: TFLGpuDelegateWaitType.active),
+        );
+      }
+
+      var interpreterOptions = InterpreterOptions()..addDelegate(delegate);
+      interpreter = await tfl.Interpreter.fromAsset('mobilefacenet.tflite',
+          options: interpreterOptions);
     } catch (e) {
       print('Failed to load model: $e');
     }
@@ -71,10 +83,12 @@ class _MyHomePageState extends State<_MyHomePage> {
 
     // Get camera description for the specified direction
     CameraDescription description = await getCamera(_direction);
-    InputImageRotation rotation = rotationIntToImageRotation(description.sensorOrientation);
+    InputImageRotation rotation =
+        rotationIntToImageRotation(description.sensorOrientation);
 
     // Initialize the camera
-    _camera = CameraController(description, ResolutionPreset.low, enableAudio: false);
+    _camera =
+        CameraController(description, ResolutionPreset.low, enableAudio: false);
     await _camera!.initialize();
     await Future.delayed(Duration(milliseconds: 500));
 
@@ -96,7 +110,8 @@ class _MyHomePageState extends State<_MyHomePage> {
         InputImage inputImage = _convertCameraImageToInputImage(image, _direction);
 
         // Detect faces using ML Kit's face detector
-        detect(image, _getDetectionMethod(), rotation).then((dynamic result) async {
+        detect(image, _getDetectionMethod(), rotation)
+            .then((dynamic result) async {
           _faceFound = result.isNotEmpty;
           Face _face;
 
@@ -123,7 +138,6 @@ class _MyHomePageState extends State<_MyHomePage> {
           });
 
           _isDetecting = false;
-
         }).catchError((_) {
           _isDetecting = false;
         });
@@ -131,44 +145,60 @@ class _MyHomePageState extends State<_MyHomePage> {
     });
   }
 
-
   // Helper method to convert CameraImage to InputImage for Google ML Kit
   InputImage _convertCameraImageToInputImage(CameraImage image, CameraLensDirection direction) {
-    final WriteBuffer allBytes = WriteBuffer();
-    for (Plane plane in image.planes) {
-      allBytes.putUint8List(plane.bytes);
+    if (Platform.isAndroid) {
+      // Android specific: Handle NV21
+      final WriteBuffer allBytes = WriteBuffer();
+      for (Plane plane in image.planes) {
+        allBytes.putUint8List(plane.bytes);
+      }
+      final bytes = allBytes.done().buffer.asUint8List();
+
+      final Size imageSize = Size(image.width.toDouble(), image.height.toDouble());
+
+      final InputImageRotation imageRotation =
+          InputImageRotationMethods.fromRawValue(
+              _camera!.description.sensorOrientation) ??
+              InputImageRotation.Rotation_0deg;
+
+      final InputImageFormat inputImageFormat =
+          InputImageFormatMethods.fromRawValue(image.format.raw) ??
+              InputImageFormat.NV21;
+
+      final planeData = image.planes.map(
+            (Plane plane) {
+          return InputImagePlaneMetadata(
+            bytesPerRow: plane.bytesPerRow,
+            height: plane.height,
+            width: plane.width,
+          );
+        },
+      ).toList();
+
+      return InputImage.fromBytes(
+        bytes: bytes,
+        inputImageData: InputImageData(
+          size: imageSize,
+          imageRotation: imageRotation,
+          inputImageFormat: inputImageFormat,
+          planeData: planeData,
+        ),
+      );
+    } else if (Platform.isIOS) {
+      return InputImage.fromBytes(
+        bytes: image.planes[0].bytes, // Simplified for iOS
+        inputImageData: InputImageData(
+          size: Size(image.width.toDouble(), image.height.toDouble()),
+          imageRotation: InputImageRotation.Rotation_0deg, // Adjust as needed
+          inputImageFormat: InputImageFormat.YUV420, // Use YUV420 for iOS
+          planeData: [], // iOS doesn't expose plane details like Android
+        ),
+      );
+    } else {
+      throw UnsupportedError("Platform not supported");
     }
-    final bytes = allBytes.done().buffer.asUint8List();
-
-    final Size imageSize = Size(image.width.toDouble(), image.height.toDouble());
-
-    // InputImageRotation (ML Kit equivalent to FirebaseVision's ImageRotation)
-    final InputImageRotation imageRotation = InputImageRotationMethods.fromRawValue(_camera!.description.sensorOrientation) ?? InputImageRotation.Rotation_0deg;
-
-    final InputImageFormat inputImageFormat = InputImageFormatMethods.fromRawValue(image.format.raw) ?? InputImageFormat.NV21;
-
-    final planeData = image.planes.map(
-          (Plane plane) {
-        return InputImagePlaneMetadata(
-          bytesPerRow: plane.bytesPerRow,
-          height: plane.height,
-          width: plane.width,
-        );
-      },
-    ).toList();
-
-    return InputImage.fromBytes(
-      bytes: bytes,
-      inputImageData: InputImageData(
-        size: imageSize,
-        imageRotation: imageRotation,
-        inputImageFormat: inputImageFormat,
-        planeData: planeData,
-      ),
-    );
   }
-
-
 
   HandleDetection _getDetectionMethod() {
     final FaceDetector faceDetector = GoogleMlKit.vision.faceDetector(
@@ -186,12 +216,15 @@ class _MyHomePageState extends State<_MyHomePage> {
   }
 
   Widget _buildResults() {
-    if (_scanResults == null || _camera == null || !_camera!.value.isInitialized) {
+    if (_scanResults == null ||
+        _camera == null ||
+        !_camera!.value.isInitialized) {
       return const Text('');
     }
     CustomPainter painter;
 
-    final Size imageSize = Size(_camera!.value.previewSize!.height, _camera!.value.previewSize!.width);
+    final Size imageSize = Size(
+        _camera!.value.previewSize!.height, _camera!.value.previewSize!.width);
     painter = FaceDetectorPainter(imageSize, _scanResults);
     return CustomPaint(
       painter: painter,
@@ -281,7 +314,8 @@ class _MyHomePageState extends State<_MyHomePage> {
     );
   }
 
-  imglib.Image _convertCameraImage(CameraImage image, CameraLensDirection _dir) {
+  imglib.Image _convertCameraImage(
+      CameraImage image, CameraLensDirection _dir) {
     int width = image.width;
     int height = image.height;
     var img = imglib.Image(width, height);
@@ -290,18 +324,23 @@ class _MyHomePageState extends State<_MyHomePage> {
     final int? uvPixelStride = image.planes[1].bytesPerPixel;
     for (int x = 0; x < width; x++) {
       for (int y = 0; y < height; y++) {
-        final int uvIndex = uvPixelStride! * (x / 2).floor() + uvyButtonStride * (y / 2).floor();
+        final int uvIndex = uvPixelStride! * (x / 2).floor() +
+            uvyButtonStride * (y / 2).floor();
         final int index = y * width + x;
         final yp = image.planes[0].bytes[index];
         final up = image.planes[1].bytes[uvIndex];
         final vp = image.planes[2].bytes[uvIndex];
         int r = (yp + vp * 1436 / 1024 - 179).round().clamp(0, 255);
-        int g = (yp - up * 46549 / 131072 + 44 - vp * 93604 / 131072 + 91).round().clamp(0, 255);
+        int g = (yp - up * 46549 / 131072 + 44 - vp * 93604 / 131072 + 91)
+            .round()
+            .clamp(0, 255);
         int b = (yp + up * 1814 / 1024 - 227).round().clamp(0, 255);
         img.data[index] = hexFF | (b << 16) | (g << 8) | r;
       }
     }
-    return (_dir == CameraLensDirection.front) ? imglib.copyRotate(img, -90) : imglib.copyRotate(img, 90);
+    return (_dir == CameraLensDirection.front)
+        ? imglib.copyRotate(img, -90)
+        : imglib.copyRotate(img, 90);
   }
 
   String _recog(imglib.Image img) {
@@ -311,7 +350,7 @@ class _MyHomePageState extends State<_MyHomePage> {
     interpreter.run(input, output);
     output = output.reshape([192]);
     e1 = List.from(output);
-    String result= compare(e1).toUpperCase();
+    String result = compare(e1).toUpperCase();
     return result;
   }
 
@@ -353,7 +392,6 @@ class _MyHomePageState extends State<_MyHomePage> {
   }
 
   String compare(List currEmb) {
-
     if (data.length == 0) return "No Face saved";
     double minDist = 999;
     double currDist = 0.0;
